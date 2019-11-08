@@ -178,6 +178,9 @@ static void draw(struct state *st)
 	}
 
 	start = st->create_sync(st->egl, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+	glFlush();
+	st->start_fence = st->dup_fence(st->egl, start);
+	st->destroy_sync(st->egl, start);
 
 	glViewport(0, 0, st->conf.width, st->conf.height);
 
@@ -193,10 +196,8 @@ static void draw(struct state *st)
 
 	eglSwapBuffers(st->egl, st->egl_surf);
 
-	st->start_fence = st->dup_fence(st->egl, start);
 	st->end_fence = st->dup_fence(st->egl, end);
 
-	st->destroy_sync(st->egl, start);
 	st->destroy_sync(st->egl, end);
 }
 
@@ -438,8 +439,9 @@ int main(int argc, char *argv[])
 			if (!start_time)
 				printf("Warning: start time is 0\n");
 
-			printf("Took %f ms to render\n",
-				(double)(end_time - start_time) * 1e-6);
+			printf("Took %f ms to render (%lu - %lu)\n",
+				(double)(end_time - start_time) * 1e-6,
+				start_time, end_time);
 			start_time = 0;
 		}
 
@@ -456,6 +458,8 @@ int main(int argc, char *argv[])
 			fds[1].events = POLLIN;
 			fds[2].fd = st.end_fence;
 			fds[2].events = POLLIN;
+
+			st.start_fence = st.end_fence = -1;
 		}
 	}
 
