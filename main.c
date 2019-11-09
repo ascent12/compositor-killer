@@ -1,17 +1,21 @@
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include <linux/sync_file.h>
 #include <poll.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
 #include <wayland-client.h>
 #include <wayland-egl.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
-#include <linux/sync_file.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
 
 #include "xdg-shell-protocol.h"
 
@@ -43,8 +47,8 @@ struct state {
 		int32_t height;
 	} conf;
 
-	int start_fence;
-	int end_fence;
+	uint64_t submit_time_ns;
+	int fence;
 };
 
 static const GLchar *vert_src =
@@ -160,7 +164,8 @@ static const struct wl_callback_listener frame_listener;
 
 static void draw(struct state *st)
 {
-	EGLSyncKHR start, end;
+	struct timespec ts;
+	EGLSyncKHR sync;
 
 	st->frame = wl_surface_frame(st->surf);
 	wl_callback_add_listener(st->frame, &frame_listener, st);
@@ -177,11 +182,6 @@ static void draw(struct state *st)
 		st->conf.serial = 0;
 	}
 
-	start = st->create_sync(st->egl, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
-	glFlush();
-	st->start_fence = st->dup_fence(st->egl, start);
-	st->destroy_sync(st->egl, start);
-
 	glViewport(0, 0, st->conf.width, st->conf.height);
 
 	//glUniform4f(st->color_loc, 0.0, 0.2, 0.0, 0.2);
@@ -190,15 +190,22 @@ static void draw(struct state *st)
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	//glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-	
 
-	end = st->create_sync(st->egl, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+	sync = st->create_sync(st->egl, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+
+	/*
+	 * TODO: Check if MONOTONIC is guranteed to be the right time domain.
+	 *
+	 * Sampling the clock from userspace might not be the most accurate way
+	 * to do this, but it's good enough for our purposes.
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	st->submit_time_ns = ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
 
 	eglSwapBuffers(st->egl, st->egl_surf);
 
-	st->end_fence = st->dup_fence(st->egl, end);
-
-	st->destroy_sync(st->egl, end);
+	st->fence = st->dup_fence(st->egl, sync);
+	st->destroy_sync(st->egl, sync);
 }
 
 static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
@@ -407,42 +414,29 @@ int main(int argc, char *argv[])
 
 	draw(&st);
 
-	struct pollfd fds[3] = {
+	struct pollfd fds[2] = {
 		{ .fd = wl_display_get_fd(st.wl), .events = POLLIN | POLLOUT },
-		{ .fd = st.start_fence, .events = POLLIN },
-		{ .fd = st.end_fence, .events = POLLIN },
+		{ .fd = st.fence, .events = POLLIN },
 	};
+	st.fence = -1;
 
-	st.start_fence = st.end_fence = -1;
-
-	uint64_t start_time = 0;
 	while (st.running) {
-		int ret = poll(fds, 3, 0);
+		int ret = poll(fds, 2, 0);
 		if (ret == -1) {
 			perror("poll");
 			break;
 		}
 
 		if (fds[1].fd != -1 && (fds[1].revents & POLLIN)) {
-			start_time = fence_timestamp(fds[1].fd);
+			uint64_t time_ns = fence_timestamp(fds[1].fd);
 			close(fds[1].fd);
 			fds[1].fd = -1;
 			fds[1].events = 0;
-		}
-
-		if (fds[2].fd != -1 && (fds[2].revents & POLLIN)) {
-			uint64_t end_time = fence_timestamp(fds[2].fd);
-			close(fds[2].fd);
-			fds[2].fd = -1;
-			fds[2].events = 0;
-
-			if (!start_time)
-				printf("Warning: start time is 0\n");
 
 			printf("Took %f ms to render (%lu - %lu)\n",
-				(double)(end_time - start_time) * 1e-6,
-				start_time, end_time);
-			start_time = 0;
+				(double)(time_ns - st.submit_time_ns) * 1e-6,
+				st.submit_time_ns, time_ns);
+			st.submit_time_ns = 0;
 		}
 
 		if (fds[0].revents & (POLLERR | POLLHUP)) {
@@ -453,13 +447,11 @@ int main(int argc, char *argv[])
 			wl_display_flush(st.wl);
 		}
 
-		if (st.start_fence != -1) {
-			fds[1].fd = st.start_fence;
+		if (st.fence != -1) {
+			fds[1].fd = st.fence;
 			fds[1].events = POLLIN;
-			fds[2].fd = st.end_fence;
-			fds[2].events = POLLIN;
 
-			st.start_fence = st.end_fence = -1;
+			st.fence = -1;
 		}
 	}
 
