@@ -12,3 +12,4 @@ This is done by drawing a very large number of iterations of the Mandlebrot set.
 - `-f <w>x<h>`: Run at a fixed size with these dimensions.
 - `-l <n>`: Draw this many frames before quitting.
 - `-u`: Run unsynchronized, i.e. ignore wl_surface.frame events.
+- '-a <n>: Anitialias n times.

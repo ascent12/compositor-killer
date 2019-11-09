@@ -35,41 +35,53 @@ struct wl_state {
 static const GLchar *vert_src =
 "precision highp float;\n"
 "attribute vec2 in_pos;\n"
-"varying vec2 v_pos;\n"
 "void main() {\n"
-"	v_pos = in_pos;\n"
 "	gl_Position = vec4(in_pos, 0.0, 1.0);\n"
 "}\n";
 
+/*
+ * https://iquilezles.org/www/articles/mset_smooth/mset_smooth.htm
+ * https://shadertoy.com/view/4df3Rn
+ */
 static const GLchar *frag_src =
 "precision highp float;\n"
-"uniform float offset;\n"
+"uniform int frame_num;\n"
 "uniform int iter;\n"
-"varying vec2 v_pos;\n"
-"vec3 hue2rgb(float h) {\n"
-"	vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);\n"
-"	vec3 p = abs(fract(vec3(h, h, h) + K.xyz) * 6.0 - K.www);\n"
-"	return mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), 1.0);\n"
-"}\n"
+"uniform int aa;\n"
+"uniform vec2 win_size;\n"
 "void main() {\n"
-"	float x0 = 1.5 * v_pos.x - 0.5;\n"
-"	float y0 = 1.5 * v_pos.y;\n"
-"	float x = 0.0;\n"
-"	float y = 0.0;\n"
-"	int i = 0;\n"
-"	while (x * x + y * y <= 4.0 && i < iter) {\n"
-"		float xtemp = x * x - y * y + x0;\n"
-"		y = 2.0 * x * y + y0;\n"
-"		x = xtemp;\n"
-"		++i;\n"
+"	vec3 col = vec3(0.0, 0.0, 0.0);\n"
+"	for (int m = 0; m < aa; ++m)\n"
+"	for (int n = 0; n < aa; ++n) {\n"
+"		float ftime = float(frame_num) / 10.0;\n"
+"		vec2 p = (-win_size + 2.0 * (gl_FragCoord.xy + vec2(float(m), float(n)) / float(aa))) / win_size.y;\n"
+"		float w = float(aa * m + n);\n"
+"		float time = ftime + 0.5 * (1.0 / 24.0) * w / float(aa * aa);\n"
+"\n"
+"		float zoo = 0.62 + 0.38 * cos(0.07 * time);\n"
+"		float coa = cos(0.15 * (1.0 - zoo) * time);\n"
+"		float sia = sin(0.15 * (1.0 - zoo) * time);\n"
+"		zoo = pow(zoo, 8.0);\n"
+"		vec2 xy = vec2(p.x * coa - p.y * sia, p.x * sia + p.y * coa);\n"
+"		vec2 c = vec2(-0.745, 0.186) + xy * zoo;\n"
+"\n"
+"		const float B = 256.0;\n"
+"		float l = 0.0;\n"
+"		vec2 z = vec2(0.0);\n"
+"		for (int i = 0; i < iter; ++i) {\n"
+"			z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;\n"
+"			if (dot(z, z) > B * B)\n"
+"				break;\n"
+"			l += 1.0;\n"
+"		}\n"
+"\n"
+"		float sl = l - log2(log2(dot(z, z))) + 4.0;\n"
+"		float al = smoothstep(-0.1, 0.0, sin(0.5 * 6.2831));\n"
+"		l = mix(l, sl, al);\n"
+"		col += 0.5 + 0.5 * cos(3.0 + l * 0.15 + vec3(0.0, 0.6, 1.0));\n"
 "	}\n"
-"	if (i == iter) {\n"
-"		gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
-"	} else {\n"
-"		float frac = float(iter) / float(i);\n"
-"		vec3 rgb = hue2rgb(log(frac) / 15.0 + offset);\n"
-"		gl_FragColor = vec4(rgb, 1.0);\n"
-"	}\n"
+"	col /= float(aa * aa);\n"
+"	gl_FragColor = vec4(col, 1.0);\n"
 "}\n";
 
 static void xdg_ping(void *data, struct xdg_wm_base *shell, uint32_t serial)
@@ -213,11 +225,12 @@ int main(int argc, char *argv[])
 	int fixed_height = 0;
 	int max_frames = INT_MAX;
 	bool unsynchronized = false;
+	int aa = 1;
 
 	/* Command line parsing */
 	{
 		int opt;
-		while ((opt = getopt(argc, argv, "i:f:l:u")) != -1) {
+		while ((opt = getopt(argc, argv, "i:f:l:ua:")) != -1) {
 			switch (opt) {
 			case 'i':
 				iter = atoi(optarg);
@@ -232,6 +245,9 @@ int main(int argc, char *argv[])
 				break;
 			case 'u':
 				unsynchronized = true;
+				break;
+			case 'a':
+				aa = atoi(optarg);
 				break;
 			default:
 				return 1;
@@ -417,7 +433,8 @@ int main(int argc, char *argv[])
 
 	/* OpenGL */
 	GLuint gl_program;
-	GLuint gl_uniform_offset;
+	GLuint gl_uniform_frame_num;
+	GLuint gl_uniform_win_size;
 
 	/* Compile GL shaders */
 	{
@@ -446,7 +463,8 @@ int main(int argc, char *argv[])
 		glDeleteShader(frag);
 	}
 
-	gl_uniform_offset = glGetUniformLocation(gl_program, "offset");
+	gl_uniform_frame_num = glGetUniformLocation(gl_program, "frame_num");
+	gl_uniform_win_size = glGetUniformLocation(gl_program, "win_size");
 
 	/* Bind all GL state now, because it will never change */
 	{
@@ -458,6 +476,7 @@ int main(int argc, char *argv[])
 		};
 		GLuint attr_in_pos = glGetAttribLocation(gl_program, "in_pos");
 		GLuint uniform_iter = glGetUniformLocation(gl_program, "iter");
+		GLuint uniform_aa = glGetUniformLocation(gl_program, "aa");
 
 		glUseProgram(gl_program);
 
@@ -465,6 +484,7 @@ int main(int argc, char *argv[])
 		glVertexAttribPointer(attr_in_pos, 2, GL_FLOAT, GL_FALSE, 0, verts);
 
 		glUniform1i(uniform_iter, iter);
+		glUniform1i(uniform_aa, aa);
 	}
 
 	/* Main loop */
@@ -484,7 +504,7 @@ int main(int argc, char *argv[])
 	fds[0].events = POLLIN | POLLOUT;
 
 	int frame_num = 0;
-	float color_offset = 0.0f;
+	//float color_offset = 0.0f;
 
 	while (!wl_state.close && frame_num < max_frames) {
 		int ret;
@@ -521,8 +541,8 @@ int main(int argc, char *argv[])
 
 			glViewport(0, 0, wl_state.width, wl_state.height);
 
-			glUniform1f(gl_uniform_offset, color_offset);
-			color_offset += 0.01;
+			glUniform2f(gl_uniform_win_size, wl_state.width, wl_state.height);
+			glUniform1i(gl_uniform_frame_num, frame_num);
 
 			glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
